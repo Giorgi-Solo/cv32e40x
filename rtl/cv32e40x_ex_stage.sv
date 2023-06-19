@@ -52,6 +52,7 @@ module cv32e40x_ex_stage import cv32e40x_pkg::*;
 
   // From controller FSM
   input  ctrl_fsm_t   ctrl_fsm_i,
+  input branch_target_mux_t branch_target_mux_i,
 
   // Register file forwarding signals (to ID)
   output logic [31:0] rf_wdata_o,
@@ -80,6 +81,8 @@ module cv32e40x_ex_stage import cv32e40x_pkg::*;
   output logic        last_op_o,
   output logic        first_op_o
 );
+  logic [31:0] offset1;
+  logic [31:0] increment;
 
   // Ready and valid signals
   logic           instr_valid;
@@ -168,7 +171,29 @@ module cv32e40x_ex_stage import cv32e40x_pkg::*;
 
   // Branch handling
   assign branch_decision_o = alu_cmp_result;
-  assign branch_target_o   = id_ex_pipe_i.operand_c;
+  // assign branch_target_o   = id_ex_pipe_i.operand_c; // TODO put mux here branch_target_mux_o // branch_target_mux_i
+  
+  // id_ex_pipe_i.instr_meta.compressed
+  
+  always_comb
+  begin
+    if(id_ex_pipe_i.instr_meta.compressed && id_ex_pipe_i.instr_valid) begin
+      increment = 32'h2;
+    end else begin
+      increment = 32'h4;
+    end
+  end
+
+  always_comb
+  begin
+
+    unique case (branch_target_mux_i)
+      OPERAND_C: branch_target_o   = id_ex_pipe_i.operand_c;
+      // NOT_KILL:  branch_target_o   = id_ex_pipe_i.pc + offset1; // offset1 is 12 or 6
+      NEXT_PC:   branch_target_o   = id_ex_pipe_i.pc + increment; // increment is  4 or 2
+      default:   branch_target_o   = id_ex_pipe_i.operand_c;
+    endcase
+  end
 
   // Detect last operation
   // Both parts of a split misaligned load/store will reach WB, but only the second half will be marked with "last_op"
@@ -354,7 +379,6 @@ module cv32e40x_ex_stage import cv32e40x_pkg::*;
       ex_wb_pipe_o.xif_meta           <= '0;
       ex_wb_pipe_o.first_op           <= 1'b0;
       ex_wb_pipe_o.last_op            <= 1'b0;
-      ex_wb_pipe_o.abort_op           <= 1'b0;
     end
     else
     begin
@@ -363,7 +387,6 @@ module cv32e40x_ex_stage import cv32e40x_pkg::*;
 
         ex_wb_pipe_o.last_op     <= last_op_o;
         ex_wb_pipe_o.first_op    <= first_op_o;
-        ex_wb_pipe_o.abort_op    <= id_ex_pipe_i.abort_op; // MPU exceptions have WB timing and will not impact ex_wb_pipe.abort_op
         // Deassert rf_we in case of illegal csr instruction or
         // when the first half of a misaligned/split LSU goes to WB.
         // Also deassert if CSR was accepted both by eXtension if and pipeline

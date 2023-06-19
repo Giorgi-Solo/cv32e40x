@@ -41,14 +41,21 @@ module cv32e40x_controller import cv32e40x_pkg::*;
   input  logic        clk_ungated_i,              // Ungated clock
   input  logic        rst_n,
 
+  // input logic        prediction_i,     // 2-bit prediction counter
+  // input logic        hit_i,
+
   input  logic        fetch_enable_i,             // Start the decoding
 
   input  logic        if_valid_i,
 
   // From IF stage
   input  logic [31:0] pc_if_i,
+  input  logic        first_op_if_i,
   input  logic        last_op_if_i,
-  input  logic        abort_op_if_i,
+  input  logic        hit_i,
+  input  logic        prediction_i,
+  output cache_cmd    cache_operatoin_o,
+  output branch_target_mux_t branch_target_mux_o,
 
   // from IF/ID pipeline
   input  if_id_pipe_t if_id_pipe_i,
@@ -60,18 +67,15 @@ module cv32e40x_controller import cv32e40x_pkg::*;
   input  logic        csr_en_raw_id_i,
   input  csr_opcode_e csr_op_id_i,
   input  logic        first_op_id_i,
-  input  logic        last_op_id_i,
-  input  logic        abort_op_id_i,
 
   input  id_ex_pipe_t id_ex_pipe_i,
+  input  logic        first_op_ex_i,
 
   input  ex_wb_pipe_t ex_wb_pipe_i,
 
   // Last operation bits
   input  logic        last_op_ex_i,               // EX contains the last operation of an instruction
   input  logic        last_op_wb_i,               // WB contains the last operation of an instruction
-
-  input  logic        abort_op_wb_i,
 
   // LSU
   input  mpu_status_e lsu_mpu_status_wb_i,        // MPU status (WB stage)
@@ -149,8 +153,13 @@ module cv32e40x_controller import cv32e40x_pkg::*;
 
     .if_valid_i                  ( if_valid_i               ),
     .pc_if_i                     ( pc_if_i                  ),
+    .first_op_if_i               ( first_op_if_i            ),
     .last_op_if_i                ( last_op_if_i             ),
-    .abort_op_if_i               ( abort_op_if_i            ),
+
+    .hit_i(hit_i),
+    .prediction_i(prediction_i),
+    .cache_operatoin_o(cache_operatoin_o),
+    .branch_target_mux_o(branch_target_mux_o),
 
     // From ID stage
     .if_id_pipe_i                ( if_id_pipe_i             ),
@@ -161,8 +170,6 @@ module cv32e40x_controller import cv32e40x_pkg::*;
     .alu_en_id_i                 ( alu_en_id_i              ),
     .sys_en_id_i                 ( sys_en_id_i              ),
     .first_op_id_i               ( first_op_id_i            ),
-    .last_op_id_i                ( last_op_id_i             ),
-    .abort_op_id_i               ( abort_op_id_i            ),
 
     // From EX stage
     .id_ex_pipe_i                ( id_ex_pipe_i             ),
@@ -170,6 +177,7 @@ module cv32e40x_controller import cv32e40x_pkg::*;
     .ex_ready_i                  ( ex_ready_i               ),
     .ex_valid_i                  ( ex_valid_i               ),
     .last_op_ex_i                ( last_op_ex_i             ),
+    .first_op_ex_i               ( first_op_ex_i            ),
 
     // From WB stage
     .ex_wb_pipe_i                ( ex_wb_pipe_i             ),
@@ -179,7 +187,6 @@ module cv32e40x_controller import cv32e40x_pkg::*;
     .wb_ready_i                  ( wb_ready_i               ),
     .wb_valid_i                  ( wb_valid_i               ),
     .last_op_wb_i                ( last_op_wb_i             ),
-    .abort_op_wb_i               ( abort_op_wb_i            ),
 
     .lsu_interruptible_i         ( lsu_interruptible_i      ),
 

@@ -72,7 +72,6 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
 
   output logic          first_op_o,
   output logic          last_op_o,
-  output logic          abort_op_o,
 
   // Stage ready/valid
   output logic          if_valid_o,
@@ -80,7 +79,14 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
 
   // eXtension interface
   if_xif.cpu_compressed xif_compressed_if,      // XIF compressed interface
-  input  logic          xif_offloading_id_i     // ID stage attempts to offload an instruction
+  input  logic          xif_offloading_id_i,     // ID stage attempts to offload an instruction
+
+  // BHT_BTB cache signals
+  input  cache_cmd      cache_operatoin_i,
+  input  logic   [31:0] ID_EX_P_pc_ex_i,  // pc forwarded from ID_EX stage pipeline
+  output logic   [31:0] target_pc_if_o,   // address of the branch target instruction send out of IF stage // TODO not necessary
+  output logic          prediction_o,     // prediction outcome
+  output logic          hit_o             // cache hit
 );
 
   logic              if_ready;
@@ -98,7 +104,8 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
 
   // flag for predecoded cm.jt / cm.jalt.
   // Maps to custom use of JAL instruction
-  logic              tbljmp;
+  logic              tbljmp_raw; // Raw table jump from compressed decoder
+  logic              tbljmp;     // Table jump which may deassert due to exceptions
 
   logic              illegal_c_insn;
 
@@ -137,6 +144,26 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
   logic              seq_last;        // sequencer is outputting the last operation
   inst_resp_t        seq_instr;       // Instruction for sequenced operation
 
+  // BTB_BHT cache signals
+  localparam int size  =   8;
+  localparam int width = $clog2(size);
+
+  logic [31:0] target_pc_if;       // address of the branch target instruction send to IF stage
+  logic [1:0]  prediction_cnt;     // 2-bit prediction counter
+  logic        hit;
+
+  logic [31:0] pc_ex_i;             // program counter from ex stage
+  logic [31:0] target_pc_ex_i;      // assign with branch_target_ex_i   // address of the branch target instruction recieved from ex stage
+  cache_cmd cache_operatoin;  
+
+  assign cache_operatoin = cache_operatoin_i;
+  assign target_pc_if_o = target_pc_if;
+  assign prediction_o = prediction_cnt[1]  & if_valid_o & id_ready_i; // TODO come up with better way to make sure inst is valid
+  assign hit_o = hit  & if_valid_o & id_ready_i;
+
+  assign pc_ex_i = ID_EX_P_pc_ex_i;
+  assign target_pc_ex_i = branch_target_ex_i;
+
   // Fetch address selection
   always_comb
   begin
@@ -148,6 +175,7 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
       PC_JUMP:       branch_addr_n = jump_target_id_i;
       PC_BRANCH:     branch_addr_n = branch_target_ex_i;
       PC_MRET:       branch_addr_n = mepc_i;                                                      // PC is restored when returning from IRQ/exception
+      PC_PREDICTED:  branch_addr_n = target_pc_if;
       PC_DRET:       branch_addr_n = dpc_i;
       PC_WB_PLUS4:   branch_addr_n = ctrl_fsm_i.pipe_pc;                                          // Jump to next instruction forces prefetch buffer reload
       PC_TRAP_EXC:   branch_addr_n = {mtvec_addr_i, 7'h0};                                        // All the exceptions go to base address
@@ -207,9 +235,9 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
 
   assign core_trans.addr      = prefetch_trans_addr;
   assign core_trans.dbg       = ctrl_fsm_i.debug_mode_if;
-  assign core_trans.prot[0]   = 1'b0;                     // Transfers from IF stage all instruction fetches
-  assign core_trans.prot[2:1] = PRIV_LVL_M;               // Machine mode
-  assign core_trans.memtype   = 2'b00;                    // memtype is assigned in the MPU, tie off.
+  assign core_trans.prot[0]   = 1'b0;  // Transfers from IF stage all instruction fetches
+  assign core_trans.prot[2:1] = PRIV_LVL_M;                // Machine mode
+  assign core_trans.memtype   = 2'b00;                       // memtype is assigned in the MPU, tie off.
 
   cv32e40x_mpu
   #(
@@ -291,29 +319,33 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
 
   // Acknowledge prefetcher when IF stage is ready. This factors in seq_ready to avoid ack'ing the
   // prefetcher in the middle of a Zc sequence.
-  assign prefetch_ready = if_ready;
+  // No need to ack the prefetcher when tbljmp==1, as this is will generate a pc_set and kill_if when
+  // the table jump is taken in ID and the pointer fetch is initiated (or the table jump is killed).
+  assign prefetch_ready = if_ready && !tbljmp;
 
   // Last operation of table jumps are set when the pointer is fed to ID stage
   // tbljmp (first operation) is set when a cm.jt or cm.jalt is decoded in the compressed decoder.
-  // Sequenced instructions set last_op from the sequencer.
-  // Any other instruction will be single operation, and gets last_op=1.
+  // Trigger matches will get all write enables deasserted in ID, and debug entered before retiring
+  // any operations once the first operation reaches WB. A trigger match is a last_op by definition.
   // todo: Factor CLIC pointers?
-  assign last_op_o = prefetch_is_tbljmp_ptr ? 1'b1 :  // tbljmp pointers are the last half
-                     tbljmp                 ? 1'b0 :  // tbljmps are the first half
-                     seq_valid              ? seq_last : 1'b1; // Any other regular instructions are single operation.
+  assign last_op_o = trigger_match_i ? 1'b1 :
+                     tbljmp          ? 1'b0 :  // tbljmps are the first half
+                     seq_valid       ? seq_last : 1'b1; // Any other regular instructions are single operation.
 
   // Flag first operation of a sequence.
-  // For table jumps the tbljmp instruction is the first operation, and the pointer is the last.
-  // Any sequenced instructions use the seq_first from the sequencer.
-  // Any other instruction will be single operation, and gets first_op=1.
+  // Sequencer will set seq_first=1 when not in use - any other instruction handled by the compressed decoder (except table jumps)
+  // will always have first_op=1 and may thus use seq_first.
+  // Would ideally be something like "seq_valid ? : seq_first : 1'b1", but that causes combinatorial loops
+  // through the controllers sequence_interruptible, via kill_ex and seq_valid and then into the first_op_o again.
+  // Trigger matches will have all write enables deasserted in ID, and once the first operation reaches WB the debug entry will be made.
+  // Marking as first (and last above) since we know it will not be a true sequence. Sequencer will keep sequencing, but will get killed
+  // upon debug entry and no side effect will occur.
+  // todo: The treatement of trigger match causes 1 instruction to possibly have first/last op set multiple times. Can this be avoided (it messes up the semantics of first/last op)?
   // todo: factor in CLIC pointers?
   assign first_op_o = prefetch_is_tbljmp_ptr ? 1'b0 :
-                      tbljmp                 ? 1'b1 :
-                      seq_valid              ? seq_first : 1'b1; // Any other regular instructions are single operation.
+                      trigger_match_i        ? 1'b1 : seq_first;
 
-
-  // Set flag to indicate that instruction/sequence will be aborted due to known exceptions or trigger match
-  assign abort_op_o = instr_decompressed.bus_resp.err || (instr_decompressed.mpu_status != MPU_OK) || trigger_match_i;
+  // todo: first/last op need to be treated in the same manner (assignments need to look more similar). Also seq_first/seq_last need cleaner semantics with respect ot how they relate to seq_valid.
 
   // Populate instruction meta data
   // Fields 'compressed' and 'tbljmp' keep their old value by default.
@@ -344,11 +376,24 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
       if_id_pipe_o.ptr              <= '0;
       if_id_pipe_o.last_op          <= 1'b0;
       if_id_pipe_o.first_op         <= 1'b0;
-      if_id_pipe_o.abort_op         <= 1'b0;
+      if_id_pipe_o.hit              <= 1'b0;
+      if_id_pipe_o.prediction       <= 1'b0;
     end else begin
       // Valid pipeline output if we are valid AND the
       // alignment buffer has a valid instruction
+      // if(prefetch_valid) begin
+      //   $display("TICK and prefetch_valid is 0x%0h, kill_if is 0x%0h, halt_if is 0x%0h, ",prefetch_valid ,ctrl_fsm_i.kill_if ,ctrl_fsm_i.halt_if);
+      // end
+      // if(ctrl_fsm_i.kill_if) begin
+      //   $display("TICK and prefetch_valid is 0x%0h, kill_if is 0x%0h, halt_if is 0x%0h, ",prefetch_valid ,ctrl_fsm_i.kill_if ,ctrl_fsm_i.halt_if);
+      // end
+      // if(ctrl_fsm_i.halt_if) begin
+      //   $display("TICK and prefetch_valid is 0x%0h, kill_if is 0x%0h, halt_if is 0x%0h, ",prefetch_valid ,ctrl_fsm_i.kill_if ,ctrl_fsm_i.halt_if);
+      // end
       if (if_valid_o && id_ready_i) begin
+        if_id_pipe_o.hit              <= hit;
+        if_id_pipe_o.prediction       <= prediction_cnt[1];
+
         if_id_pipe_o.instr_valid      <= 1'b1;
         if_id_pipe_o.instr_meta       <= instr_meta_n;
         // seq_valid implies no illegal instruction, sequencer successfully decoded an instruction.
@@ -360,7 +405,6 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
         if_id_pipe_o.xif_id           <= xif_id;
         if_id_pipe_o.last_op          <= last_op_o;
         if_id_pipe_o.first_op         <= first_op_o;
-        if_id_pipe_o.abort_op         <= abort_op_o;
 
         // No PC update for tablejump pointer, PC of instruction itself is needed later.
         // No update to the meta compressed, as this is used in calculating the link address.
@@ -368,8 +412,7 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
         // No update to tbljmp flag, we want flag to be high for both operations.
         if (!prefetch_is_tbljmp_ptr) begin
           if_id_pipe_o.pc                    <= pc_if_o;
-          // Sequenced instructions are marked as illegal by the compressed decoder, however, the instr_compressed
-          // flag is still set and can be used when propagating to ID.
+          // todo: push/pop*/doublemoves are compressed, how (if at all) should we signal that when we emit uncompressed sequences?
           if_id_pipe_o.instr_meta.compressed <= instr_compressed;
           if_id_pipe_o.instr_meta.tbljmp     <= tbljmp;
 
@@ -397,6 +440,32 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
     end
   end
 
+  
+
+  cv32e40x_BTB_BTH 
+  #(
+      .size  ( size ),
+      .width ( width  )
+  )
+  cv32e40x_BTB_BTH_cache
+  (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    // inputs/outputs from/to IF stage
+    .pc_if_i(pc_if_o),                  // program counter from IF stage
+    .target_pc_if_o(target_pc_if),      // address of the branch target instruction send to IF stage
+    .prediction_cnt_o(prediction_cnt),  // 2-bit prediction counter
+    .hit_o(hit),                        // hit is 1 if pc_if corresponds to one of the cachelines
+
+    // inputs from ex stage
+    .pc_ex_i(pc_ex_i),                  // program counter from ex stage
+    .target_pc_ex_i(target_pc_ex_i),    // address of the branch target instruction recieved from ex stage
+    
+    // input from controller
+    .cache_operatoin(cache_operatoin)    
+  );
+
   cv32e40x_compressed_decoder
   #(
       .ZC_EXT ( ZC_EXT ),
@@ -410,17 +479,17 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
     .instr_o            ( instr_decompressed      ),
     .is_compressed_o    ( instr_compressed        ),
     .illegal_instr_o    ( illegal_c_insn          ),
-    .tbljmp_o           ( tbljmp                  )
+    .tbljmp_o           ( tbljmp_raw              )
   );
 
   // Setting predec_ready to id_ready_i here instead of passing it through the predecoder.
   // Predecoder is purely combinatorial and is always ready for new inputs
   assign predec_ready = id_ready_i;
 
-  // Sequencer gets valid inputs regardless of known error conditions
-  // Error conditions will cause a 'deassert_we' in the ID stage and exceptions
-  // will be taken from WB with no side effects performed.
-  assign seq_instr_valid = prefetch_valid;
+  // Do not signal valid to the sequencer in case of a trigger match.
+  // No need for the sequencer to start a sequence, the instruction will cause
+  // debug entry on the first operation with no side effects done.
+  assign seq_instr_valid = prefetch_valid && !trigger_match_i;
 
   generate
     if (ZC_EXT) begin : gen_seq
@@ -450,11 +519,22 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
       assign seq_last  = 1'b0;
       assign seq_instr = '0;
       assign seq_ready = 1'b1;
-      assign seq_first = 1'b0;
+      assign seq_first = 1'b1; // Tie high to enable default first_op when ZC_EXT=0 // todo: Clean up semantics of seq_first and make this one default 0.
     end
   endgenerate
 
 
+  // tbljmp below is used in calculating 'last_op_o'. If we have a faulted fetch, the instruction word may be anything
+  // (not cleared on faulted fetches). A faulted fetch should not be decoded to anything and thus tbljmp is cleared.
+  // One could instead set the instruction word itself to all zeros or another illegal instruction on known fetch faults,
+  // but this may impact timing more than suppressing control bits.
+  // Deassert also for trigger matches, as this will be a single operation and enter debug mode before executing. Similar to how
+  // deassert_we is set in the ID stage for trigger matches.
+  assign tbljmp = (instr_decompressed.bus_resp.err || (instr_decompressed.mpu_status != MPU_OK)) ? 1'b0 :
+                  trigger_match_i ? 1'b0 : tbljmp_raw;
+
+// todo: The above tbljmp assignment is likely very timing critical. Why is it important to suppress table jumps here, whereas the same thing is not done for non-sequenced compressed instructions nor for sequenced instructions.
+// In fact sequenced instructions seems only gated by trigger match, which also seems inconsistent. Can't all further handling of bus/parity/MPU/trigger match be done in ID?
 
   //---------------------------------------------------------------------------
   // eXtension interface

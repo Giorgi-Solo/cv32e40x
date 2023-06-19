@@ -330,7 +330,7 @@ module cv32e40x_alignment_buffer import cv32e40x_pkg::*;
     instr_cnt_n = instr_cnt_q;
     n_flush_branch = outstanding_cnt_q;
 
-    if(ctrl_fsm_i.kill_if) begin
+    if(ctrl_fsm_i.kill_if || ctrl_fsm_i.clear_fifo) begin
       // FIFO content is invalidated when IF is killed
       instr_cnt_n = 'd0;
 
@@ -364,7 +364,6 @@ module cv32e40x_alignment_buffer import cv32e40x_pkg::*;
       2'b11 : begin
         outstanding_cnt_n = outstanding_cnt_q;
       end
-      default;
     endcase
   end
 
@@ -502,7 +501,7 @@ module cv32e40x_alignment_buffer import cv32e40x_pkg::*;
     begin
       // on a kill signal from outside we invalidate the content of the FIFO
       // completely and start from an empty state
-      if (ctrl_fsm_i.kill_if) begin
+      if (ctrl_fsm_i.kill_if || ctrl_fsm_i.clear_fifo) begin
         valid_q <= '0;
       end else begin
         // Update FIFO content on a valid response
@@ -548,7 +547,7 @@ module cv32e40x_alignment_buffer import cv32e40x_pkg::*;
         end
       end
       // Set pop-bit when instruction is emitted.
-      pop_q <= (instr_valid_o && instr_ready_i);
+      pop_q <= (instr_valid_o && instr_ready_i) && !ctrl_fsm_i.clear_fifo;
 
       aligned_q <= aligned_n;
       complete_q <= complete_n;

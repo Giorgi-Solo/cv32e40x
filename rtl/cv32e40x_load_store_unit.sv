@@ -175,7 +175,6 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
           2'b01: be = 4'b0010;
           2'b10: be = 4'b0100;
           2'b11: be = 4'b1000;
-          default:;
         endcase; // case (trans.addr[1:0])
       end
       2'b01:
@@ -187,7 +186,6 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
             2'b01: be = 4'b0110;
             2'b10: be = 4'b1100;
             2'b11: be = 4'b1000;
-            default:;
           endcase; // case (trans.addr[1:0])
         end
         else
@@ -204,7 +202,6 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
             2'b01: be = 4'b1110;
             2'b10: be = 4'b1100;
             2'b11: be = 4'b1000;
-            default:;
           endcase; // case (trans.addr[1:0])
         end
         else
@@ -214,7 +211,6 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
             2'b01: be = 4'b0001;
             2'b10: be = 4'b0011;
             2'b11: be = 4'b0111;
-            default:;
           endcase; // case (trans.addr[1:0])
         end
       end
@@ -231,7 +227,6 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
       2'b01: wdata = {trans.wdata[23:0], trans.wdata[31:24]};
       2'b10: wdata = {trans.wdata[15:0], trans.wdata[31:16]};
       2'b11: wdata = {trans.wdata[ 7:0], trans.wdata[31: 8]};
-      default:;
     endcase; // case (trans.addr[1:0])
   end
 
@@ -389,7 +384,6 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
           if (trans.addr[0] != 1'b0)
             misaligned_halfword = 1'b1;
         end
-        default:;
       endcase // case (trans.size)
     end
   end
@@ -516,7 +510,7 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
   assign count_down = resp_valid;                       // Decrement upon accepted transfer response
 
   always_comb begin
-    case ({count_up, count_down})
+    unique case ({count_up, count_down})
       2'b00 : begin
         next_cnt = cnt_q;
       end
@@ -529,7 +523,6 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
       2'b11 : begin
         next_cnt = cnt_q;
       end
-      default:;
     endcase
   end
 

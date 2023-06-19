@@ -27,6 +27,19 @@
 
 package cv32e40x_pkg;
 
+  typedef enum logic [1:0] {INCREMENT = 2'h0, DECREMENT = 2'h1, NEW_ENTRY = 2'h2, NOP = 2'h3} cache_cmd;
+ 
+  typedef enum logic [1:0] {OPERAND_C = 2'h0, NOT_KILL = 2'h1, NEXT_PC = 2'h2} branch_target_mux_t;
+
+  parameter TAG_WIDTH = 31;
+
+  typedef struct
+  {
+    logic valid;
+    logic [TAG_WIDTH - 1:0] tag;
+    logic [31:0] target_pc;
+    logic [1:0] prediction_cnt;
+  }cache_line_t;
 ////////////////////////////////////////////////
 //    ___         ____          _             //
 //   / _ \ _ __  / ___|___   __| | ___  ___   //
@@ -846,6 +859,7 @@ typedef enum logic[3:0] {
   PC_BOOT       = 4'b0000,
   PC_MRET       = 4'b0001,
   PC_DRET       = 4'b0010,
+  PC_PREDICTED  = 4'b0011,
   PC_JUMP       = 4'b0100,
   PC_BRANCH     = 4'b0101,
   PC_WB_PLUS4   = 4'b0110,
@@ -1052,7 +1066,9 @@ typedef struct packed {
   logic [31:0] ptr;              // Flops to hold 32-bit pointer
   logic        first_op;         // First part of multi operation instruction
   logic        last_op;          // Last part of multi operation instruction
-  logic        abort_op;         // Instruction will be aborted due to known exceptions or trigger matches
+  logic        hit;
+  logic        prediction;
+  logic [31:0] target_pc_if;
 } if_id_pipe_t;
 
 // ID/EX pipeline
@@ -1121,8 +1137,10 @@ typedef struct packed {
 
   logic         first_op;         // First part of multi operation instruction
   logic         last_op;          // Last part of multi operation instruction
-  logic         abort_op;         // Instruction will be aborted due to known exceptions or trigger matches
-
+  
+  logic         hit;
+  logic         prediction;
+  logic [31:0] target_pc_if;
 } id_ex_pipe_t;
 
 // EX/WB pipeline
@@ -1170,7 +1188,6 @@ typedef struct packed {
 
   logic         first_op;         // First part of multi operation instruction
   logic         last_op;          // Last part of multi operation instruction
-  logic         abort_op;         // Instruction will be aborted due to known exceptions or trigger matches
 } ex_wb_pipe_t;
 
 // Performance counter events
@@ -1205,7 +1222,6 @@ typedef struct packed {
   logic         mnxti_stall;            // Stall due to mnxti CSR access in EX
   logic         minstret_stall;         // Stall due to minstret/h read in EX
   logic         deassert_we;            // Deassert write enable and special insn bits
-  logic         id_stage_abort;         // Same signal as deassert_we, with better name for use in the controller.
   logic         xif_exception_stall;    // Stall (EX) if xif insn in WB can cause an exception
 } ctrl_byp_t;
 
@@ -1219,6 +1235,7 @@ typedef struct packed {
   logic        pc_set_clicv;          // Signal pc_set it for CLIC vectoring pointer load
   logic        pc_set_tbljmp;         // Signal pc_set is for Zc* cm.jt / cm.jalt pointer load
   pc_mux_e     pc_mux;                // Selector in the Fetch stage to select the rigth PC (normal, jump ...)
+  logic clear_fifo;
 
   // To WB stage
   logic        block_data_addr;       // To LSU to prevent data_addr_wb_i updates between error and taken NMI
@@ -1274,9 +1291,6 @@ typedef struct packed {
 
   // Kill signal for xif_commit_if
   logic        kill_xif; // Kill (attempted) offloaded instruction
-
-  // Signal that an exception is in WB
-  logic        exception_in_wb;
 } ctrl_fsm_t;
 
   ////////////////////////////////////////

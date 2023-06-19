@@ -77,8 +77,6 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
   output logic        sys_en_o,
 
   output logic        first_op_o,
-  output logic        last_op_o,
-  output logic        abort_op_o,
 
   // RF interface -> controller
   output logic [REGFILE_NUM_READ_PORTS-1:0] rf_re_o,
@@ -309,7 +307,6 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
     unique case (imm_a_mux_sel)
       IMMA_Z:      imm_a = imm_z_type;
       IMMA_ZERO:   imm_a = '0;
-      default:     imm_a = '0;
     endcase
   end
 
@@ -550,14 +547,19 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
 
       id_ex_pipe_o.first_op               <= 1'b0;
       id_ex_pipe_o.last_op                <= 1'b0;
-      id_ex_pipe_o.abort_op               <= 1'b0;
+
+      id_ex_pipe_o.hit                    <= 1'b0;
+      id_ex_pipe_o.prediction             <= 1'b0;
     end else begin
       // normal pipeline unstall case
       if (id_valid_o && ex_ready_i) begin
+
+        id_ex_pipe_o.hit                    <= if_id_pipe_i.hit;
+        id_ex_pipe_o.prediction             <= if_id_pipe_i.prediction;
+
         id_ex_pipe_o.instr_valid  <= 1'b1;
-        id_ex_pipe_o.last_op      <= last_op_o;
-        id_ex_pipe_o.first_op     <= first_op_o;
-        id_ex_pipe_o.abort_op     <= abort_op_o;
+        id_ex_pipe_o.last_op      <= if_id_pipe_i.last_op;
+        id_ex_pipe_o.first_op     <= if_id_pipe_i.first_op;
 
         // Operands
         if (alu_op_a_mux_sel != OP_A_NONE) begin
@@ -682,9 +684,7 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
   // multi_cycle_id_stall is currently tied to 1'b0. Will be used for Zce push/pop instructions.
   assign id_valid_o = (instr_valid && !xif_waiting) || (multi_cycle_id_stall && !ctrl_fsm_i.kill_id && !ctrl_fsm_i.halt_id);
 
-  assign first_op_o  = if_id_pipe_i.first_op;
-  assign last_op_o   = if_id_pipe_i.last_op;
-  assign abort_op_o  = if_id_pipe_i.abort_op || ctrl_byp_i.id_stage_abort;
+  assign first_op_o = if_id_pipe_i.first_op;
   //---------------------------------------------------------------------------
   // eXtension interface
   //---------------------------------------------------------------------------

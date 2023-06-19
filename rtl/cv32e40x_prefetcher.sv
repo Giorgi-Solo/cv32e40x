@@ -119,8 +119,6 @@ module cv32e40x_prefetcher
           next_state = IDLE;
         end
       end // case: BRANCH_WAIT
-
-      default:;
     endcase
   end
 

@@ -215,8 +215,6 @@ module cv32e40x_controller_bypass import cv32e40x_pkg::*;
     end
   end
 
-  assign ctrl_byp_o.id_stage_abort = ctrl_byp_o.deassert_we;
-
   // Forwarding control unit
   always_comb
   begin

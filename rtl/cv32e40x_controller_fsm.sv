@@ -48,9 +48,12 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
 
   // From IF stage
   input  logic [31:0] pc_if_i,
+  input  logic        first_op_if_i,              // IF stage is handling the first operation of a sequence.
   input  logic        last_op_if_i,               // IF stage is handling the last operation of a sequence.
-  input  logic        abort_op_if_i,              // IF stage contains an operation that will be aborted (bus error or MPU exception)
-
+  input  logic        hit_i,                      // BHT hit from IF stage
+  input  logic        prediction_i,               // Branch prediction made in IF stage
+  output cache_cmd    cache_operatoin_o,
+  output branch_target_mux_t branch_target_mux_o,
   // From ID stage
   input  if_id_pipe_t if_id_pipe_i,
   input  logic        alu_jmp_id_i,               // Jump in ID
@@ -58,19 +61,17 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
   input  logic        alu_en_id_i,                // alu_en qualifier for jumps
   input  logic        sys_en_id_i,                // sys_en qualifier for mret
   input  logic        first_op_id_i,              // ID stage is handling the first operation of a sequence
-  input  logic        last_op_id_i,               // ID stage is handling the last operation of a sequence
-  input  logic        abort_op_id_i,              // ID stage contains an (to be) aborted instruction or sequence
 
   // From EX stage
   input  id_ex_pipe_t id_ex_pipe_i,
   input  logic        branch_decision_ex_i,       // branch decision signal from EX ALU
   input  logic        last_op_ex_i,               // EX stage contains the last operation of an instruction
+  input  logic        first_op_ex_i,              // EX stage is handling the first operation of a sequence
 
   // From WB stage
   input  ex_wb_pipe_t ex_wb_pipe_i,
   input  logic [1:0]  lsu_err_wb_i,               // LSU caused bus_error in WB stage, gated with data_rvalid_i inside load_store_unit
   input  logic        last_op_wb_i,               // WB stage contains the last operation of an instruction
-  input  logic        abort_op_wb_i,              // WB stage contains an (to be) aborted instruction or sequence
 
   // From LSU (WB)
   input  mpu_status_e lsu_mpu_status_wb_i,        // MPU status (WB timing)
@@ -120,6 +121,13 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
   if_xif.cpu_commit    xif_commit_if,
   input                xif_csr_error_i
 );
+
+// branch_target_mux_t branch_target_mux_o;   // TODO make this output
+logic        hit_ex;                       // BHT hit from ID_EX pipe reg
+logic        prediction_ex;                // prediction from ID_EX pipe reg
+cache_cmd    cache_operatoin;
+logic cache_update_n; 
+logic cache_update_q; 
 
    // FSM state encoding
   ctrl_state_e ctrl_fsm_cs, ctrl_fsm_ns;
@@ -220,17 +228,11 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
   logic       csr_flush_ack_q;
 
   // Flag for checking if multi op instructions are in an interruptible state
-  logic       sequence_in_progress_wb;
   logic       sequence_interruptible;
 
   // Flag for checking if ID stage can be halted
   // Used to not halt sequences in the middle, potentially causing deadlocks
-  logic       sequence_in_progress_id;
   logic       id_stage_haltable;
-
-  assign sequence_interruptible = !sequence_in_progress_wb;
-
-  assign id_stage_haltable = !sequence_in_progress_id;
 
   assign fencei_ready = !lsu_busy_i;
 
@@ -280,11 +282,14 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
 
   // EX stage
   // Branch taken for valid branch instructions in EX with valid decision
-
-  assign branch_in_ex = id_ex_pipe_i.alu_bch && id_ex_pipe_i.alu_en && id_ex_pipe_i.instr_valid && branch_decision_ex_i;
+  
+  assign hit_ex        = id_ex_pipe_i.hit && id_ex_pipe_i.instr_valid;                       // BHT hit from ID_EX pipe reg
+  assign prediction_ex = id_ex_pipe_i.prediction && id_ex_pipe_i.instr_valid;
+  
+  assign branch_in_ex = id_ex_pipe_i.alu_bch && id_ex_pipe_i.alu_en && id_ex_pipe_i.instr_valid && !branch_taken_q;// && branch_decision_ex_i; // TODO remove branch_decision_ex_i, come up with new name for signal
 
   // Blocking on branch_taken_q, as a branch ha already been taken
-  assign branch_taken_ex = branch_in_ex && !branch_taken_q;
+  assign branch_taken_ex = branch_in_ex && branch_decision_ex_i; // && !branch_taken_q;
 
   // Exception in WB if the following evaluates to 1
   // Not checking for ex_wb_pipe_i.last_op to enable exceptions to be taken as soon as possible for
@@ -295,8 +300,6 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
                             (ex_wb_pipe_i.sys_en && ex_wb_pipe_i.sys_ecall_insn)                   ||
                             (ex_wb_pipe_i.sys_en && ex_wb_pipe_i.sys_ebrk_insn)                    ||
                             (lsu_mpu_status_wb_i != MPU_OK)) && ex_wb_pipe_i.instr_valid;
-
-  assign ctrl_fsm_o.exception_in_wb = exception_in_wb;
 
   // Set exception cause
   assign exception_cause_wb = (ex_wb_pipe_i.instr.mpu_status != MPU_OK)                  ? EXC_CAUSE_INSTR_FAULT     :
@@ -381,7 +384,7 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
   assign non_shv_irq_ack = ctrl_fsm_o.irq_ack && !irq_clic_shv_i;
 
   // single step becomes pending when the last operation of an instruction is done in WB, or we ack a non-shv interrupt.
-  assign pending_single_step = (!debug_mode_q && dcsr_i.step && ((wb_valid_i && (last_op_wb_i || abort_op_wb_i)) || non_shv_irq_ack)) && !pending_debug;
+  assign pending_single_step = (!debug_mode_q && dcsr_i.step && ((wb_valid_i && last_op_wb_i) || non_shv_irq_ack)) && !pending_debug;
 
   // Separate flag for pending single step when doing CLIC SHV, evaluated while in POINTER_FETCH stage
   assign pending_single_step_ptr = !debug_mode_q && dcsr_i.step && (wb_valid_i || 1'b1) && !pending_debug;
@@ -468,12 +471,41 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
   assign ctrl_fsm_o.mhpmevent.if_invalid    = !if_valid_i && id_ready_i;
   assign ctrl_fsm_o.mhpmevent.id_invalid    = !id_valid_i && ex_ready_i;
   assign ctrl_fsm_o.mhpmevent.ex_invalid    = !ex_valid_i && wb_ready_i;
-  assign ctrl_fsm_o.mhpmevent.wb_invalid    = !wb_valid_i;
+  assign ctrl_fsm_o.mhpmevent.wb_invalid    = !(wb_valid_i && last_op_wb_i);
   assign ctrl_fsm_o.mhpmevent.id_jalr_stall = ctrl_byp_i.jalr_stall && !id_valid_i && ex_ready_i;
   assign ctrl_fsm_o.mhpmevent.id_ld_stall   = ctrl_byp_i.load_stall && !id_valid_i && ex_ready_i;
   assign ctrl_fsm_o.mhpmevent.wb_data_stall = data_stall_wb_i;
 
+  // Detect if we are in the middle of a multi operation sequence
+  // Basically check if the oldest instruction in the pipeline is a 'first_op'
+  // - if not, we have an unfinished sequence and cannot interrupt it.
+  // Used to determine if we are allowed to take debug or interrupts
+  always_comb begin
+    if (ex_wb_pipe_i.instr_valid) begin
+      sequence_interruptible = ex_wb_pipe_i.first_op;
+    end else if (id_ex_pipe_i.instr_valid) begin
+      sequence_interruptible = first_op_ex_i;
+    end else if (if_id_pipe_i.instr_valid) begin
+      sequence_interruptible = first_op_id_i;
+    end else begin
+      sequence_interruptible = first_op_if_i; // todo: first/last op should always be classified with instr_vali; if not it needs proper explanation.
+    end
+  end
 
+  // Check if we are allowed to halt the ID stage.
+  // If ID stage contains a non-first operation, we cannot halt ID as that
+  // could cause a deadlock because a sequence cannot finish through ID.
+  // If ID stage does not contain a valid instruction, the same check is performed
+  // for the IF stage (although this is likely not needed).
+  always_comb begin
+    if (if_id_pipe_i.instr_valid) begin
+      id_stage_haltable = first_op_id_i;
+    end else begin
+      // IF stage first_op defaults to 1'b1 if the stage does not hold a valid instruction or
+      // table jump pointer. Table jump pointers will have first_op set to 0.
+      id_stage_haltable = first_op_if_i; // todo: first/last op should always be classified with instr_valid; if not it needs proper explanation (and I would prefer if we get rid of this special reliance on the 1'b1 default)
+    end
+  end
 
   // Mux used to select PC from the different pipeline stages
   always_comb begin
@@ -489,6 +521,25 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
     endcase
   end
 
+  always_comb begin // Ensures that BTB_BHT_Cache is updated only once per instruction.
+    if(cache_update_n && !cache_update_q && id_ex_pipe_i.instr_valid) begin
+      cache_operatoin_o = cache_operatoin;
+      // $display("cache_operation ####BEGIN#######");
+      // $display("cache_operation is %s and %s and PC_ex is 0x%0h",cache_operatoin_o, cache_operatoin, id_ex_pipe_i.pc);
+      // $display("cache_operation ####END#######");
+    end else begin
+      cache_operatoin_o = NOP;
+    end
+    // if(ctrl_fsm_o.kill_if == 1'b1) begin
+    //   $display("####BEGIN####### IF KILLED ####END#######");
+    // end
+    // if(ctrl_fsm_o.halt_if == 1'b1) begin
+    //   $display("####BEGIN####### IF HALTED ####END#######");
+    // end
+    // if(!branch_in_ex && !jump_taken_id)begin
+    //   $display("ctrl_fsm_i.pc_mux is %s ????????????????????????????????????????????",ctrl_fsm_o.pc_mux);
+    // end
+  end
   //////////////
   // FSM comb //
   //////////////
@@ -500,6 +551,7 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
 
     ctrl_fsm_o.pc_mux           = PC_BOOT;
     ctrl_fsm_o.pc_set           = 1'b0;
+    ctrl_fsm_o.clear_fifo = 1'b0;
 
     ctrl_fsm_o.irq_ack          = 1'b0;
     ctrl_fsm_o.irq_id           = '0;
@@ -508,6 +560,8 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
     ctrl_fsm_o.irq_shv          = '0;
     ctrl_fsm_o.dbg_ack          = 1'b0;
 
+    cache_operatoin             = NOP;
+    branch_target_mux_o         = OPERAND_C;
     // IF stage is halted if an instruction has been issued during single step
     // to avoid more than one instructions passing down the pipe.
     ctrl_fsm_o.halt_if          = single_step_halt_if_q;
@@ -558,6 +612,7 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
 
     // Ensure jumps and branches are taken only once
     branch_taken_n              = branch_taken_q;
+    cache_update_n = cache_update_q;
 
     fencei_flush_req_set        = 1'b0;
 
@@ -668,6 +723,13 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
           end
 
         end else begin
+          
+          // $display("branch_in_ex ####BEGIN#######");
+          // $display("branch_in_ex is 0x%0h",branch_in_ex);
+          // $display("PC_if is 0x%0h PC_id is 0x%0h and PC_ex is 0x%0h and PC_wb is 0x%0h",pc_if_i,if_id_pipe_i.pc,id_ex_pipe_i.pc, ex_wb_pipe_i.pc);
+          // $display("if_valid_i is 0x%0h and id_ready_i is 0x%0h id_valid_i is 0x%0h and ex_ready_i is 0x%0h and ex_valid_i is 0x%0h and wb_ready_i is 0x%0h and wb_valid_i is 0x%0h",if_valid_i,id_ready_i,id_valid_i,ex_ready_i,ex_valid_i,wb_ready_i,wb_valid_i);
+          // $display("alu_bch is 0x%0h, alu_en is 0x%0h, instr_valid is 0x%0h, branch_taken_q is 0x%0h  ",id_ex_pipe_i.alu_bch , id_ex_pipe_i.alu_en , id_ex_pipe_i.instr_valid ,branch_taken_q);//id_ex_pipe_i.alu_bch && id_ex_pipe_i.alu_en && id_ex_pipe_i.instr_valid && !branch_taken_q
+          // $display("branch_in_ex ####END#######");
           if (exception_in_wb && exception_allowed) begin
             // Kill all stages
             ctrl_fsm_o.kill_if = 1'b1;
@@ -767,16 +829,128 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
             ctrl_fsm_o.pc_mux    = PC_WB_PLUS4;
 
 
-          end else if (branch_taken_ex) begin
-            ctrl_fsm_o.kill_if = 1'b1;
-            ctrl_fsm_o.kill_id = 1'b1;
+          end else if (branch_in_ex) begin // branch instr in ex stage..../ branch_taken_ex
+            // ctrl_fsm_o.kill_if = 1'b1;
+            // ctrl_fsm_o.kill_id = 1'b1;
 
             ctrl_fsm_o.pc_mux  = PC_BRANCH;
             ctrl_fsm_o.pc_set  = 1'b1;
-
-            // Set flag to avoid further branches to the same target
-            // if we are stalled
             branch_taken_n     = 1'b1;
+            cache_update_n     = 1'b1;
+            
+            // $display("####BEGIN#######");
+            // $display("HIT_EX is 0x%0h and PC_ex is 0x%0h",hit_ex,id_ex_pipe_i.pc);
+            // $display("HIT_EX ####END#######");
+            
+            if(!hit_ex) begin // Detected Branch instruction is not in BHT_BTB_cache
+              
+              cache_operatoin = NEW_ENTRY; // ADD branch instruction to the BHT_BTB_cache
+
+              if(branch_taken_ex) begin
+
+                ctrl_fsm_o.kill_if = 1'b1;
+                ctrl_fsm_o.kill_id = 1'b1;
+                ctrl_fsm_o.pc_mux  = PC_BRANCH;
+
+                branch_target_mux_o = OPERAND_C;
+                // $display("1");
+              end else begin
+                ctrl_fsm_o.kill_if = 1'b0;
+                ctrl_fsm_o.kill_id = 1'b0;
+                ctrl_fsm_o.pc_mux  = PC_BOOT;
+
+                branch_target_mux_o = OPERAND_C; // TODO check if we have known branch in IF
+                ctrl_fsm_o.pc_set   = 1'b0;
+                branch_taken_n      = 1'b0;
+                // $display("2");
+                if(hit_i && prediction_i) begin
+                  ctrl_fsm_o.pc_mux  = PC_PREDICTED;
+                  ctrl_fsm_o.pc_set  = 1'b1;
+                  ctrl_fsm_o.clear_fifo = 1'b1;
+                  branch_taken_n     = 1'b0;
+                  // $display("3");
+                end
+                // $display("4");
+                if(jump_taken_id) begin // TODO check if we have jump in ID 
+                  ctrl_fsm_o.kill_if = 1'b1;
+                  branch_taken_n     = 1'b1;
+                  // $display("5");
+
+                  if (sys_mret_id) begin
+                    ctrl_fsm_o.pc_mux = PC_MRET;
+                    ctrl_fsm_o.pc_set = 1'b1;
+                  end else begin
+                    ctrl_fsm_o.pc_mux        = if_id_pipe_i.instr_meta.tbljmp && !if_id_pipe_i.last_op ? PC_TBLJUMP :
+                                              if_id_pipe_i.instr_meta.tbljmp && if_id_pipe_i.last_op  ? PC_POINTER : PC_JUMP;
+                    ctrl_fsm_o.pc_set        = 1'b1;
+                    ctrl_fsm_o.pc_set_tbljmp = if_id_pipe_i.instr_meta.tbljmp && !if_id_pipe_i.last_op;
+                  end
+                end
+              end
+            end else begin // Detected Branch instruction is in BHT_BTB_cache
+              
+              // Determine cache operation. If branch is taken, increment prediction counter
+              if(branch_taken_ex) begin
+                cache_operatoin = INCREMENT;
+              end else begin
+                cache_operatoin = DECREMENT;
+              end
+
+              // Determine correctness of prediction. If branch decision is same as prediction, do not kill IF and ID stages
+              if(branch_taken_ex == prediction_ex) begin
+                ctrl_fsm_o.kill_if = 1'b0;
+                ctrl_fsm_o.kill_id = 1'b0;
+
+                ctrl_fsm_o.pc_mux  = PC_BOOT;
+
+                branch_target_mux_o = OPERAND_C; // TODO check if we have known branch in IF
+                ctrl_fsm_o.pc_set   = 1'b0;
+                branch_taken_n      = 1'b0;
+                // $display("7");
+
+                if(hit_i && prediction_i) begin
+                  ctrl_fsm_o.pc_mux  = PC_PREDICTED;
+                  ctrl_fsm_o.pc_set  = 1'b1;
+                  ctrl_fsm_o.clear_fifo = 1'b1;
+                  branch_taken_n     = 1'b0;
+                  // $display("8");
+                end
+                // $display("9");
+
+                if(jump_taken_id) begin // TODO check if we have jump in ID 
+                  ctrl_fsm_o.kill_if = 1'b1;
+                  branch_taken_n     = 1'b1;
+                  // $display("10");
+
+                  if (sys_mret_id) begin
+                    ctrl_fsm_o.pc_mux = PC_MRET;
+                    ctrl_fsm_o.pc_set = 1'b1;
+                  end else begin
+                    ctrl_fsm_o.pc_mux        = if_id_pipe_i.instr_meta.tbljmp && !if_id_pipe_i.last_op ? PC_TBLJUMP :
+                                              if_id_pipe_i.instr_meta.tbljmp && if_id_pipe_i.last_op  ? PC_POINTER : PC_JUMP;
+                    ctrl_fsm_o.pc_set        = 1'b1;
+                    ctrl_fsm_o.pc_set_tbljmp = if_id_pipe_i.instr_meta.tbljmp && !if_id_pipe_i.last_op;
+                  end
+                end
+                
+              end else begin
+                ctrl_fsm_o.kill_if = 1'b1;
+                ctrl_fsm_o.kill_id = 1'b1;
+                ctrl_fsm_o.pc_mux  = PC_BRANCH;
+                // $display("11");
+                if(branch_taken_ex) begin
+                  branch_target_mux_o = OPERAND_C;
+                end else begin
+                  branch_target_mux_o = NEXT_PC;
+                end 
+              end
+
+            end
+            // $display("####END#######");
+
+            // // Set flag to avoid further branches to the same target
+            // // if we are stalled
+            // branch_taken_n     = 1'b1;
 
           end else if (jump_taken_id) begin
             // Jumps in ID (JAL, JALR, mret)
@@ -806,7 +980,18 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
             // Set flag to avoid further jumps to the same target
             // if we are stalled
             branch_taken_n = 1'b1;
-          end
+          end else if (hit_i && prediction_i) begin // TODO create 1 signal for the conditoin. If branch is predicted to be TAKEN
+            // ctrl_fsm_o.kill_if = 1'b0;
+            // ctrl_fsm_o.kill_id = 1'b0;
+
+            ctrl_fsm_o.pc_mux  = PC_PREDICTED;
+            ctrl_fsm_o.pc_set  = 1'b1;
+            ctrl_fsm_o.clear_fifo = 1'b1;
+
+            // Set flag to avoid further branches to the same target
+            // if we are stalled
+            // branch_taken_n     = 1'b1;
+          end 
 
           // Mret in WB restores CSR regs
           //
@@ -935,13 +1120,16 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
     // Detect first insn issue in single step after dret
     // Any Zc sequence must fully complete (last_op_if_i) before halting the IF stage.
     // Used to block further issuing
-    if (!ctrl_fsm_o.debug_mode && dcsr_i.step && !single_step_halt_if_q && (if_valid_i && id_ready_i && (last_op_if_i || abort_op_if_i))) begin
+    if (!ctrl_fsm_o.debug_mode && dcsr_i.step && !single_step_halt_if_q && (if_valid_i && id_ready_i && last_op_if_i)) begin
       single_step_halt_if_n = 1'b1;
     end
 
     // Clear jump/branch flag when new insn is emitted from IF
     if (branch_taken_q && if_valid_i && id_ready_i) begin
       branch_taken_n = 1'b0;
+    end
+    if(cache_update_q && id_valid_i && ex_ready_i) begin
+      cache_update_n = 1'b0;
     end
   end
 
@@ -1011,10 +1199,12 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
     if (rst_n == 1'b0) begin
       single_step_halt_if_q <= 1'b0;
       branch_taken_q        <= 1'b0;
+      cache_update_q <= 1'b0;
       csr_flush_ack_q       <= 1'b0;
     end else begin
       single_step_halt_if_q <= single_step_halt_if_n;
       branch_taken_q        <= branch_taken_n;
+      cache_update_q <= cache_update_n;
       csr_flush_ack_q       <= csr_flush_ack_n;
     end
   end
@@ -1059,54 +1249,6 @@ module cv32e40x_controller_fsm import cv32e40x_pkg::*;
         if (!ctrl_fsm_o.halt_wb) begin
           wb_counter_event <= 1'b0;
         end
-      end
-    end
-  end
-
-  // Instruction sequences may not be interrupted/killed if the first operation has already been retired.
-  // Flop set when first_op without either last_op or abort_op is done in WB, and cleared when last_op is done.
-  always_ff @(posedge clk, negedge rst_n) begin
-    if (rst_n == 1'b0) begin
-      sequence_in_progress_wb <= 1'b0;
-    end else begin
-      if (!sequence_in_progress_wb) begin
-        if (wb_valid_i && ex_wb_pipe_i.first_op && !(last_op_wb_i || abort_op_wb_i)) begin // wb_valid implies ex_wb_pipe.instr_valid
-          sequence_in_progress_wb <= 1'b1;
-        end
-      end else begin
-        // sequence_in_progress_wb is set, clear when last_op retires or sequence is aborted.
-        if (wb_valid_i && (last_op_wb_i || abort_op_wb_i)) begin
-          sequence_in_progress_wb <= 1'b0;
-        end
-
-        // No need to reset this flag on kill_wb.
-        // When flag is high, there should be no reason to kill WB as they are blocked by the flag itself.
-      end
-    end
-  end
-
-  // Logic to track first_op and last_op through the ID stage to detect unhaltable sequences
-  // Flop set when first_op is done in ID, and cleared when last_op is done, or ID is killed
-  // If the ID stage first_op has a known exception or trigger match the flop will not be set
-  // as the controller will either take an exception or enter debug mode without finishing the sequence.
-  always_ff @(posedge clk, negedge rst_n) begin
-    if (rst_n == 1'b0) begin
-      sequence_in_progress_id <= 1'b0;
-    end else begin
-      if (!sequence_in_progress_id) begin
-        if (id_valid_i && ex_ready_i && first_op_id_i && !(last_op_id_i || abort_op_id_i)) begin // id_valid implies if_id_pipe.instr.valid
-          sequence_in_progress_id <= 1'b1;
-        end
-      end else begin
-        // sequence_in_progress_id is set, clear when last_op retires
-        if (id_valid_i && ex_ready_i && (last_op_id_i || abort_op_id_i)) begin
-          sequence_in_progress_id <= 1'b0;
-        end
-      end
-
-      // Reset flag if ID stage is killed
-      if (ctrl_fsm_o.kill_id) begin
-        sequence_in_progress_id <= 1'b0;
       end
     end
   end
